@@ -22,8 +22,10 @@ endif()
 #   -DGEMM_FOUNDRY_CUDA_ARCHITECTURES="80;90"
 #   -DGEMM_FOUNDRY_CUDA_ARCHITECTURES="native"  (CMake 3.24+, GPU visible at configure time)
 # Blackwell targets (e.g. 100 and 120) require a CUDA Toolkit that supports them.
-set(GEMM_FOUNDRY_CUDA_ARCHITECTURES "75;80;86;89;90" CACHE STRING
-    "Semicolon-separated CUDA architectures for gemm-foundry (or 'native')"
+set(GEMM_FOUNDRY_CUDA_ARCHITECTURES
+    "75-real;80-real;86-real;89-real;90-real;100-real;120-real;75-virtual"
+    CACHE STRING
+    "NVIDIA GPU architectures: native code plus a compute_75 PTX fallback"
 )
 
 if(GEMM_FOUNDRY_CUDA_ARCHITECTURES STREQUAL "")
@@ -56,6 +58,7 @@ add_library(gemm_foundry
     src/kernels/gemm_tiled.cuh
     src/kernels/gemm_register_blocked.cuh
     src/kernels/gemm_precision.cuh
+    src/tensor_cores/gemm_wmma.cuh
 )
 
 add_library(gemm_foundry::gemm_foundry ALIAS gemm_foundry)

@@ -15,7 +15,9 @@ namespace gemm_foundry{
     enum class Algorithm {
         naive,
         tiled,
-        register_blocked
+        register_blocked,
+        tensor_core,
+        automatic
     };
 
     enum class GemmDataType {

@@ -8,6 +8,7 @@
 #include "kernels/gemm_naive.cuh"
 #include "kernels/gemm_tiled.cuh"
 #include "kernels/gemm_register_blocked.cuh"
+#include "tensor_cores/gemm_wmma.cuh"
 
 namespace gemm_foundry::detail{
 namespace{
@@ -70,11 +71,37 @@ namespace{
         }
         return scale == 1.0f ;
     }
+
+    Status choose_automatic_algorithm(const GemmOptions& options , GemmDataType type_a ,GemmDataType type_b, GemmDataType type_c , Algorithm& selected){
+        int device = 0;
+        if(cudaGetDevice(&device) != cudaSuccess){
+            return Status::cuda_error;
+        }
+
+        cudaDeviceProp properties {};
+        if(cudaGetDeviceProperties(&properties , device) != cudaSuccess){
+            return Status::cuda_error;
+        }
+
+        const int compute_capability = properties.major * 10 + properties.minor;
+        const bool fp16_supported_combo = type_a == GemmDataType::fp16 && type_b == GemmDataType::fp16 && (type_c == GemmDataType::fp16 || type_c == GemmDataType::fp32);
+        const bool large_problems = options.M >= 64  && options.N >= 64 && options.K >= 64;
+
+        // conditions for using tensor core architecture
+        if(large_problems && fp16_supported_combo && compute_capability >= 75){
+            selected = Algorithm::tensor_core;
+        }else if(large_problems){
+            selected = Algorithm::register_blocked;
+        }else{
+            selected = Algorithm::tiled;
+        }
+
+        return Status::success;
+    }
 /*
 This tells the GPU to perform that multiplication.
 Its job it to prepare and launch GPU but doesn't calculate the matrix product itself.
 */
-
 Status validate_request(const GemmOptions& options , const void* d_A , const void* d_B ,void* d_C , GemmDataType type_a , GemmDataType type_b , GemmDataType type_c , const GemmScaleOptions& scaling , dim3& grid){
     const auto M = options.M;
     const auto N = options.N;
@@ -131,6 +158,10 @@ Status validate_request(const GemmOptions& options , const void* d_A , const voi
 
         case Algorithm::register_blocked:
             tile = 32;
+            break;
+
+        case Algorithm::tensor_core:
+            tile  = 16;
             break;
 
         default:
@@ -246,6 +277,32 @@ Status launch_typed(const DispatchParams& p){
     return Status::success;
 }
 
+// created a seperate launcher for tensore cores
+template<typename TC>
+Status launch_wmma_fp16(const DispatchParams& p){
+    const __half* A = static_cast<const __half*>(p.d_A);
+    const __half* B = static_cast<const __half*>(p.d_B);
+    TC* C = static_cast<TC*>(p.d_C);
+
+    const auto& o = p.options;
+
+    gemm_wmma_fp16_kernel<TC>
+        <<< p.grid , dim3(32)>>>(
+            A , B ,C ,
+            o.M ,o.N , o.K ,
+            static_cast<float>(p.alpha),
+            static_cast<float>(p.beta),
+            p.scaling.a_dequant_scale,
+            p.scaling.b_dequant_scale,
+            o.lda, o.ldb, o.ldc,
+            o.transpose_a, o.transpose_b,
+            o.stride_a, o.stride_b, o.stride_c
+        );
+    if(cudaGetLastError() != cudaSuccess){
+        return Status::cuda_error;
+    }   
+    return Status::success; 
+}
 // Dispatch FP16/FP8 inputs to their allowed output storage types. Both paths accumulate in FP32.
 template <typename TA , typename TB>
 Status dispatch_float_accum_output(const DispatchParams& p , GemmDataType type_c){
@@ -260,6 +317,19 @@ Status dispatch_float_accum_output(const DispatchParams& p , GemmDataType type_c
 
 // Dispatch validated type combinations to concrete template instantiations
 Status dispatch_types(const DispatchParams& p , GemmDataType type_a , GemmDataType type_b , GemmDataType type_c){
+    if(p.options.algorithm == Algorithm::tensor_core){
+        if(type_a != GemmDataType::fp16 || type_b != GemmDataType::fp16){
+            return Status::unsupported_type;
+        }
+        if(type_c == GemmDataType::fp16){
+            return launch_wmma_fp16<__half>(p);
+        }
+        if(type_c == GemmDataType::fp32){
+            return launch_wmma_fp16<float>(p);
+        }
+        return Status::unsupported_type;
+    }
+
     // FP32 x FP32 -> FP32
     if(type_a == GemmDataType::fp32 && type_b == GemmDataType::fp32 && type_c == GemmDataType::fp32){
         return launch_typed<float , float , float , float>(p);
@@ -291,21 +361,30 @@ Status dispatch_types(const DispatchParams& p , GemmDataType type_a , GemmDataTy
     return Status::unsupported_type;
 }
 
+
 }   // anonymous namespace
 
 Status gemm_dispatch_impl(const GemmOptions& options , const void* d_A ,const void* d_B , void* d_C , double alpha , double beta , GemmDataType type_a , GemmDataType type_b , GemmDataType type_c, const GemmScaleOptions& scaling){
-    if(!is_supported_runtime_combination(type_a,type_b,type_c)){
-        return Status::unsupported_type;
+    GemmOptions effective_options = options;
+    if(effective_options.algorithm == Algorithm::automatic){
+        Algorithm selected {};
+
+        const Status selection_status = choose_automatic_algorithm(effective_options,type_a,type_b,type_c,selected);
+        if(selection_status != Status::success){
+            return selection_status;
+        }
+
+        effective_options.algorithm = selected;
     }
     dim3 grid{};
 
-    const Status validation = validate_request(options,d_A,d_B,d_C,type_a,type_b,type_c, scaling ,grid);
+    const Status validation = validate_request(effective_options,d_A,d_B,d_C,type_a,type_b,type_c, scaling ,grid);
 
     if(validation != Status::success){
         return validation;
     }
 
-    const DispatchParams params{options,d_A,d_B,d_C , alpha , beta , scaling , grid};
+    const DispatchParams params{effective_options,d_A,d_B,d_C , alpha , beta , scaling , grid};
     return dispatch_types(params, type_a,type_b ,type_c);
 }
 
