@@ -1,0 +1,79 @@
+name: GPU tests (simulated)
+
+# Optional, non-required check. The hosted runners have no GPU, so the CUDA
+# tests cannot run in a normal CI job. This runs the gemm_foundry_tests ctest
+# entry on a simulated NVIDIA H100 provided by PantheonSim
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behaviour or timing, so it complements real-GPU testing
+# and does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/**"
+      - "include/**"
+      - "tests/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-sim-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gpu-tests:
+    name: Tests on a simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # 90-virtual embeds PTX only (the simulator JIT-compiles PTX) and the
+      # shared CUDA runtime is required by the simulator.
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGEMM_FOUNDRY_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+            -DGEMM_FOUNDRY_BUILD_TESTS=ON
+
+      - name: Build the tests
+        run: |
+          vgpu run --preload cmake --build build -j3 --target gemm_foundry_tests
+
+      # The test prints one PASS line per case (3 algorithms x 5 cases) and a
+      # final summary. The job fails if the summary, a PASS line, or the
+      # simulated device line is missing, or if a FAIL line or a simulator
+      # error shows up.
+      - name: Run the tests
+        run: |
+          set -o pipefail
+          status=0
+          vgpu run ctest --test-dir build -R '^gemm_foundry_tests$' --no-tests=error \
+            --timeout 1800 --output-on-failure -V 2>&1 | tee ctest.log || status=1
+          grep -q 'virtual GPU platform initialized: 1 x nvidia/h100' ctest.log \
+            || { echo "no simulated device line"; status=1; }
+          grep -q 'ALL GEMM TESTS PASSED' ctest.log \
+            || { echo "no pass summary"; status=1; }
+          grep -q '100% tests passed, 0 tests failed out of 1' ctest.log \
+            || { echo "ctest did not pass"; status=1; }
+          passes=$(grep -c '^PASS | ' ctest.log || true)
+          echo "PASS lines: $passes"
+          [ "$passes" -eq 15 ] || { echo "expected 15 PASS lines"; status=1; }
+          if grep -Eq 'FAIL \||GEMM TESTS FAILED|Not Run|Skipped|VirtualGPU error|CUDA error|no CUDA device' ctest.log; then
+            echo "failed test, skip, or device error"; status=1
+          fi
+          exit $status
